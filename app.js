@@ -134,6 +134,60 @@ function fileToDataURL(file) {
   });
 }
 
+/* ----------------------- Image optimization ----------------------- */
+// Screenshots straight from a phone can be 3–8 MB each. Stored raw, a few dozen
+// recipes balloon IndexedDB and the export file. We downscale to a sane ceiling
+// and re-encode as JPEG — visually identical for recipe reading, ~10x smaller.
+
+const IMG_MAX_EDGE = 1600;   // longest edge for stored images
+const IMG_QUALITY = 0.82;
+const THUMB_EDGE = 128;      // tiny thumb for grid cards
+const THUMB_QUALITY = 0.7;
+
+function loadImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Image decode failed"));
+    img.src = dataUrl;
+  });
+}
+
+async function compressImage(dataUrl, maxEdge = IMG_MAX_EDGE, quality = IMG_QUALITY) {
+  try {
+    const img = await loadImage(dataUrl);
+    let { width, height } = img;
+    const scale = Math.min(1, maxEdge / Math.max(width, height));
+    // Already small and already JPEG? keep as is to avoid pointless recompression
+    if (scale === 1 && dataUrl.startsWith("data:image/jpeg") && dataUrl.length < 500000) {
+      return dataUrl;
+    }
+    width = Math.round(width * scale);
+    height = Math.round(height * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    // white backdrop so transparent PNGs don't turn black in JPEG
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(img, 0, 0, width, height);
+    const out = canvas.toDataURL("image/jpeg", quality);
+    // JPEG re-encode occasionally comes out bigger (e.g. tiny graphics) — keep the smaller one
+    return out.length < dataUrl.length ? out : dataUrl;
+  } catch {
+    return dataUrl; // never lose an image over a failed optimization
+  }
+}
+
+async function makeThumb(dataUrl) {
+  try {
+    return await compressImage(dataUrl, THUMB_EDGE, THUMB_QUALITY);
+  } catch {
+    return null;
+  }
+}
+
 /* ----------------------- Rendering: tag bar ----------------------- */
 
 function renderTagBar() {
@@ -295,8 +349,10 @@ function createCardEl(r) {
   avatar.className = "card-avatar";
   if (r.images && r.images.length) {
     const img = document.createElement("img");
-    img.src = r.images[0];
+    img.src = r.thumb || r.images[0];
     img.alt = "";
+    img.loading = "lazy";
+    img.decoding = "async";
     avatar.appendChild(img);
   } else {
     avatar.innerHTML = `<svg class="icon"><use href="#${fallbackIconFor(r.id)}"/></svg>`;
@@ -474,7 +530,7 @@ async function handleIncomingFiles(fileList) {
   for (const f of files) {
     try {
       const dataUrl = await fileToDataURL(f);
-      currentImages.push(dataUrl);
+      currentImages.push(await compressImage(dataUrl));
     } catch (err) {
       console.error("Could not read image:", err);
     }
@@ -501,6 +557,7 @@ async function saveRecipeFromForm(e) {
     link: document.getElementById("fLink").value.trim(),
     linkText: document.getElementById("fLinkText").value.trim(),
     images: [...currentImages],
+    thumb: currentImages.length ? await makeThumb(currentImages[0]) : null,
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now
   };
@@ -572,6 +629,8 @@ function renderGallery(images) {
     const img = document.createElement("img");
     img.src = src;
     img.alt = "";
+    img.loading = i === 0 ? "eager" : "lazy";
+    img.decoding = "async";
     img.addEventListener("click", () => openLightbox(images, i));
     track.appendChild(img);
   });
@@ -581,11 +640,11 @@ function renderGallery(images) {
     dots.appendChild(dot);
   });
 
-  track.addEventListener("scroll", () => {
+  track.onscroll = () => {
     const idx = Math.round(track.scrollLeft / track.clientWidth);
     [...dots.children].forEach((d, i) => d.classList.toggle("is-active", i === idx));
     galleryIndex = idx;
-  });
+  };
 }
 
 function scrollGallery(dir) {
@@ -657,6 +716,7 @@ async function importData(file) {
         link: item.link || "",
         linkText: item.linkText || "",
         images: Array.isArray(item.images) ? item.images : [],
+        thumb: item.thumb || null,
         createdAt: item.createdAt || Date.now(),
         updatedAt: item.updatedAt || Date.now()
       };
@@ -684,11 +744,16 @@ async function checkPendingShare() {
   if (!pending) return;
   await dbClearPendingShare();
 
+  const compressed = [];
+  for (const src of pending.images || []) {
+    compressed.push(await compressImage(src));
+  }
+
   openNewRecipeModal({
     title: pending.title,
     text: pending.text,
     url: pending.url,
-    images: pending.images
+    images: compressed
   });
   showToast("Shared content loaded — review and save");
 }
@@ -707,9 +772,11 @@ function wireEvents() {
   });
   document.getElementById("fTags").addEventListener("focus", updateTagSuggestions);
 
+  let searchDebounce;
   document.getElementById("searchInput").addEventListener("input", (e) => {
     searchTerm = e.target.value;
-    renderMain();
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(renderMain, 120);
   });
 
   document.getElementById("sortSelect").addEventListener("change", (e) => {
@@ -822,6 +889,36 @@ async function boot() {
     } catch (err) {
       console.warn("Service worker registration failed:", err);
     }
+  }
+
+  optimizeExistingRecipes(); // quiet background pass, no await
+}
+
+// One-time-ish background migration: recipes saved before image optimization
+// existed get their images shrunk and a thumb generated. Runs idle, one record
+// at a time, so it never blocks the UI.
+async function optimizeExistingRecipes() {
+  const needsWork = recipes.filter(
+    (r) => (r.images && r.images.length && !r.thumb) ||
+           (r.images || []).some((src) => src.length > 900000)
+  );
+  if (!needsWork.length) return;
+
+  let touched = 0;
+  for (const r of needsWork) {
+    try {
+      const images = [];
+      for (const src of r.images) images.push(await compressImage(src));
+      const updated = { ...r, images, thumb: await makeThumb(images[0]) };
+      await dbPut(updated);
+      touched++;
+    } catch (err) {
+      console.warn("Optimization skipped for", r.id, err);
+    }
+  }
+  if (touched) {
+    recipes = await dbGetAll();
+    renderMain();
   }
 }
 

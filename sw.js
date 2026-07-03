@@ -2,7 +2,7 @@
 // Network-first caching (so new deploys aren't stuck behind a stale cache),
 // plus handling of the Web Share Target POST.
 
-const CACHE_NAME = "copper-thyme-v1";
+const CACHE_NAME = "copper-thyme-v2";
 const CORE_FILES = [
   "./index.html",
   "./style.css",
